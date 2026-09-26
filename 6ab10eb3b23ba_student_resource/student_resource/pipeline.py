@@ -427,7 +427,7 @@ def build_bm25_model(corpus_tokens, cache_name="s2s3"):
 
 
 def run_tfidf_blocking_batched(s1_texts, tfidf_vec, tfidf_mat, s2s3_ids,
-                                top_k=20, batch_size=10000):
+                                top_k=20, batch_size=250):
     """TF-IDF char n-gram blocking — batched sparse cosine similarity."""
     n = len(s1_texts)
     results = {}
