@@ -328,7 +328,7 @@ def build_tfidf_blocker(texts, ids, cache_prefix):
 # no dense matrix anywhere. Uses band hashing, not dot products.
 # datasketch: MIT license ✓
 
-MINHASH_NUM_PERM = 128      # accuracy/speed tradeoff sweet spot
+MINHASH_NUM_PERM = 64       # accuracy/speed tradeoff (reduced from 128 to prevent OOM)
 MINHASH_THRESHOLD = 0.15    # low = high recall; tune on val if needed
 
 
