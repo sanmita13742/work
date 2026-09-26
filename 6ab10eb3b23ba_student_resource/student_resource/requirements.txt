@@ -28,6 +28,9 @@ rank-bm25==0.2.2
 # HNSW approximate nearest-neighbor index
 hnswlib==0.8.0
 
+# MinHash LSH for character-level fuzzy blocking — MIT license
+datasketch>=1.6.4
+
 # Transformer models (LaBSE, cross-encoder)
 sentence-transformers==3.0.1
 transformers==4.42.4

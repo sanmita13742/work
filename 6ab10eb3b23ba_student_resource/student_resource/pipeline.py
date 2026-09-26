@@ -74,6 +74,7 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from datasketch import MinHash, MinHashLSH
 from rapidfuzz import fuzz
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -288,7 +289,11 @@ def run_stage_1(split: str = "train"):
 # ===========================================================================
 
 def build_tfidf_blocker(texts, ids, cache_prefix):
-    """Build and cache TF-IDF char n-gram vectorizer + matrix."""
+    """Build and cache TF-IDF char n-gram vectorizer + matrix.
+
+    NOTE: This TF-IDF is kept for Stage 3 feature computation (tfidf_cosine
+    features) but is NO LONGER used as a blocker. Blocker A is now MinHash LSH.
+    """
     vec_path = os.path.join(CACHE_DIR, f"tfidf_{cache_prefix}_vectorizer.pkl")
     mat_path = os.path.join(CACHE_DIR, f"tfidf_{cache_prefix}_matrix.npz")
     ids_path = os.path.join(CACHE_DIR, f"tfidf_{cache_prefix}_ids.pkl")
@@ -315,6 +320,133 @@ def build_tfidf_blocker(texts, ids, cache_prefix):
     print(f"    TF-IDF ({cache_prefix}): vocab={len(vectorizer.vocabulary_):,}, "
           f"matrix={matrix.shape}")
     return vectorizer, matrix, ids
+
+
+# ── BLOCKER A: MinHash LSH on character trigrams ────────────────────────
+# Replaces: TF-IDF char n-gram cosine (caused 540hr runtime)
+# Why MinHash LSH: same character-level fuzzy recall, sublinear query time,
+# no dense matrix anywhere. Uses band hashing, not dot products.
+# datasketch: MIT license ✓
+
+MINHASH_NUM_PERM = 128      # accuracy/speed tradeoff sweet spot
+MINHASH_THRESHOLD = 0.15    # low = high recall; tune on val if needed
+
+
+def _char_trigrams(s: str) -> set:
+    """Character trigrams of a normalized string."""
+    s = s.strip()
+    if len(s) < 3:
+        return {s}
+    return {s[i:i+3] for i in range(len(s) - 2)}
+
+
+def _make_minhash(text: str, num_perm: int = MINHASH_NUM_PERM) -> MinHash:
+    m = MinHash(num_perm=num_perm)
+    for tg in _char_trigrams(text):
+        m.update(tg.encode('utf8'))
+    return m
+
+
+def build_blocker_a(records_s2s3: pd.DataFrame,
+                    cache_path: str = None) -> tuple:
+    """
+    Build MinHash LSH index over all S2+S3 norm_names.
+    Returns (lsh, minhashes_dict).
+
+    Build time: ~60-120s for 10M records.
+    Query time: ~1-5ms per S1 entity.
+    RAM: ~2GB. No dense matrix anywhere.
+
+    Loads from cache if cache_path exists — skip rebuild on reruns.
+    """
+    if cache_path is None:
+        cache_path = os.path.join(CACHE_DIR, "blocker_a.pkl")
+
+    if os.path.exists(cache_path):
+        print(f"    [Blocker A] Loading from cache: {cache_path}")
+        return joblib.load(cache_path)
+
+    print(f"    [Blocker A] Building MinHash LSH "
+          f"(threshold={MINHASH_THRESHOLD}, num_perm={MINHASH_NUM_PERM}) ...")
+
+    lsh = MinHashLSH(threshold=MINHASH_THRESHOLD, num_perm=MINHASH_NUM_PERM)
+    minhashes = {}
+
+    for i, (_, row) in enumerate(records_s2s3.iterrows()):
+        eid = row['entity_id']
+        m = _make_minhash(row['norm_name'])
+        try:
+            lsh.insert(eid, m)
+        except ValueError:
+            # duplicate key — skip (shouldn't happen with unique entity_ids)
+            pass
+        minhashes[eid] = m
+        if i % 500_000 == 0 and i > 0:
+            print(f"      indexed {i:,} records ...")
+
+    os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else ".", exist_ok=True)
+    joblib.dump((lsh, minhashes), cache_path, compress=3)
+    print(f"    [Blocker A] Done. Indexed {len(minhashes):,} records. Saved to {cache_path}")
+    return lsh, minhashes
+
+
+def query_blocker_a(norm_name_s1: str, lsh: MinHashLSH) -> set:
+    """Query MinHash LSH for a single S1 norm_name."""
+    m = _make_minhash(norm_name_s1)
+    return set(lsh.query(m))
+
+
+# ── BLOCKER D: Token Inverted Index ─────────────────────────────────────
+# Catches: exact important-word matches BM25 misses due to IDF weighting
+# Example: "Reliance" appears in many records → BM25 downweights it.
+#          But sharing "Reliance" is still strong blocking signal.
+# Build time: ~3-10 seconds. Query time: <1ms. RAM: <100MB.
+
+# Tokens too common across ALL businesses to carry identity signal.
+# Keep this list minimal — over-filtering kills recall.
+_BSTOP = {
+    'the', 'and', 'of', 'a', 'an', 'in', 'for', 'at', 'by', 'to',
+    'company', 'limited', 'private', 'corporation', 'incorporated',
+    'services', 'group', 'international', 'national',
+    # deliberately NOT including: technologies, systems, solutions,
+    # industries, enterprises — these carry domain identity signal
+}
+
+
+def build_blocker_d(records_s2s3: pd.DataFrame,
+                    min_token_len: int = 4) -> dict:
+    """
+    Build token → set[entity_id] inverted index over S2+S3 norm_names.
+    Only indexes tokens of length >= min_token_len not in _BSTOP.
+    """
+    print("    [Blocker D] Building token inverted index ...")
+    index = defaultdict(set)
+    for _, row in records_s2s3.iterrows():
+        for token in row['norm_name'].split():
+            if len(token) >= min_token_len and token not in _BSTOP:
+                index[token].add(row['entity_id'])
+    print(f"    [Blocker D] Done. Unique index tokens: {len(index):,}")
+    return dict(index)
+
+
+def query_blocker_d(norm_name_s1: str,
+                    index: dict,
+                    min_shared: int = 1,
+                    min_token_len: int = 4) -> set:
+    """
+    Return all S2+S3 entity_ids sharing >= min_shared content tokens
+    with the S1 name.
+    min_shared=1 → maximum recall (correct for business names)
+    """
+    tokens = {t for t in norm_name_s1.split()
+              if len(t) >= min_token_len and t not in _BSTOP}
+    if not tokens:
+        return set()
+    hits = defaultdict(int)
+    for token in tokens:
+        for eid in index.get(token, set()):
+            hits[eid] += 1
+    return {eid for eid, cnt in hits.items() if cnt >= min_shared}
 
 
 def encode_labse_batched(entity_ids, texts, cache_name, batch_size=512):
@@ -403,7 +535,7 @@ def build_bm25_model(corpus_tokens, cache_name="s2s3"):
     """Build BM25 model on tokenized corpus.
 
     BM25Okapi on 10M+ docs can use 20–40 GB RAM. If memory is insufficient,
-    returns None and the pipeline falls back to 2-blocker mode (TF-IDF + HNSW).
+    returns None and the pipeline falls back to 2-blocker mode (HNSW + MinHash).
     """
     bm25_path = os.path.join(CACHE_DIR, f"bm25_model_{cache_name}.pkl")
     if os.path.exists(bm25_path):
@@ -422,33 +554,8 @@ def build_bm25_model(corpus_tokens, cache_name="s2s3"):
         return bm25
     except MemoryError:
         print("    WARNING: Not enough memory to build BM25. Skipping Blocker C.")
-        print("    Pipeline will use 2 blockers (TF-IDF + HNSW) instead of 3.")
+        print("    Pipeline will use 2 blockers (MinHash + HNSW) instead of 4.")
         return None
-
-
-def run_tfidf_blocking_batched(s1_texts, tfidf_vec, tfidf_mat, s2s3_ids,
-                                top_k=20, batch_size=250):
-    """TF-IDF char n-gram blocking — batched sparse cosine similarity."""
-    n = len(s1_texts)
-    results = {}
-    for start in tqdm(range(0, n, batch_size), desc="    Blocker A (TF-IDF)"):
-        end = min(start + batch_size, n)
-        batch_vecs = tfidf_vec.transform(s1_texts[start:end])
-        # Sparse cosine similarity → keep only top-k per row
-        sims = sk_cosine_similarity(batch_vecs, tfidf_mat, dense_output=False)
-        for i in range(sims.shape[0]):
-            row = sims.getrow(i)
-            data = row.data
-            indices = row.indices
-            if len(data) == 0:
-                results[start + i] = []
-                continue
-            k = min(top_k, len(data))
-            top_local = np.argpartition(data, -k)[-k:]
-            top_local = top_local[np.argsort(data[top_local])][::-1]
-            cands = [(s2s3_ids[indices[j]], float(data[j])) for j in top_local]
-            results[start + i] = cands
-    return results
 
 
 def run_hnsw_blocking(s1_embeddings, hnsw_index, top_k=25, batch_size=10000):
@@ -485,25 +592,36 @@ def run_bm25_blocking(s1_queries, bm25, s2s3_ids, top_k=15):
     return results
 
 
-def union_and_cap_candidates(s1_ids, blocker_a, blocker_b_labels, blocker_b_dists,
-                              blocker_c, s2s3_ids, cap=60):
-    """Union all blocker results and cap per S1 entity."""
+def union_and_cap_candidates(s1_ids, s1_names, lsh, blocker_b_labels,
+                              blocker_b_dists, blocker_c, s2s3_ids,
+                              token_index, cap=60):
+    """Union all 4 blocker results and cap per S1 entity.
+
+    Blockers:
+      A — MinHash LSH (char trigram fuzzy)
+      B — LaBSE HNSW (semantic, multilingual)
+      C — BM25 (ranked word match)
+      D — Token Inverted Index (exact content words)
+
+    Priority order when capping: B > A > C > D
+    """
     candidates = {}
     bm25_scores_cache = {}
 
     for i, s1_id in enumerate(tqdm(s1_ids, desc="    Union candidates")):
-        # Blocker B (dense): keep all
+        norm_name = s1_names[i] if i < len(s1_names) else ""
+
+        # ── Blocker B: LaBSE HNSW (semantic) ─────────────────────────
         b_cands = set()
         if i < len(blocker_b_labels):
             for idx in blocker_b_labels[i]:
                 if idx < len(s2s3_ids):
                     b_cands.add(s2s3_ids[idx])
 
-        # Blocker A (TF-IDF)
-        a_cands_scored = blocker_a.get(i, [])
-        a_cands = set(c[0] for c in a_cands_scored)
+        # ── Blocker A: MinHash LSH (char trigram fuzzy) ──────────────
+        a_cands = query_blocker_a(norm_name, lsh) if lsh is not None else set()
 
-        # Blocker C (BM25)
+        # ── Blocker C: BM25 (ranked word match) ──────────────────────
         c_cands_scored = blocker_c.get(i, [])
         c_cands = set(c[0] for c in c_cands_scored)
 
@@ -511,25 +629,21 @@ def union_and_cap_candidates(s1_ids, blocker_a, blocker_b_labels, blocker_b_dist
         for cid, score in c_cands_scored:
             bm25_scores_cache[(s1_id, cid)] = score
 
-        # Union
-        all_cands = b_cands | a_cands | c_cands
+        # ── Blocker D: Token inverted index (exact content words) ────
+        d_cands = query_blocker_d(norm_name, token_index) if token_index else set()
 
-        # Cap at limit
+        # Union of all 4 blockers
+        all_cands = b_cands | a_cands | c_cands | d_cands
+
+        # Cap at limit with priority-ordered fill
         if len(all_cands) > cap:
-            # Priority: keep all B, fill from A by score, then C
-            kept = set(list(b_cands)[:cap])
-            remaining = cap - len(kept)
-            if remaining > 0:
-                a_sorted = sorted(a_cands_scored, key=lambda x: x[1], reverse=True)
-                for cid, _ in a_sorted:
-                    if cid not in kept and remaining > 0:
-                        kept.add(cid)
-                        remaining -= 1
-            if remaining > 0:
-                for cid, _ in c_cands_scored:
-                    if cid not in kept and remaining > 0:
-                        kept.add(cid)
-                        remaining -= 1
+            # Priority: B (semantic) > A (fuzzy char) > C (ranked word) > D (exact word)
+            kept = set(b_cands)                       # always keep all HNSW
+            for pool in [a_cands, c_cands, d_cands]:
+                if len(kept) >= cap:
+                    break
+                remaining = cap - len(kept)
+                kept |= set(list(pool - kept)[:remaining])
             all_cands = kept
 
         candidates[s1_id] = list(all_cands)
@@ -551,7 +665,14 @@ def write_candidate_pairs(candidates, s1_ids_ordered):
 
 
 def run_stage_2(data, split_data=None, mode="train"):
-    """Run all three blockers and union results."""
+    """Run all four blockers and union results.
+
+    Blockers:
+      A — MinHash LSH on character trigrams (fuzzy name match)
+      B — LaBSE HNSW (semantic, multilingual embedding match)
+      C — BM25 (ranked word match on name+address)
+      D — Token Inverted Index (exact content-word match)
+    """
     t0 = time.time()
     print("=" * 50 + f" STAGE 2: BLOCKING ({mode}) " + "=" * 50)
 
@@ -580,18 +701,29 @@ def run_stage_2(data, split_data=None, mode="train"):
     print(f"    S1 entities: {len(s1_ids):,}")
     print(f"    S2+S3 entities: {len(s2s3_ids):,}")
 
-    # ---- Blocker A: TF-IDF on name ----
+    # ---- Build TF-IDF on name (for Stage 3 feature reuse ONLY, NOT for blocking) ----
     tfidf_name_vec, tfidf_name_mat, tfidf_name_ids = build_tfidf_blocker(
         s2s3_names, s2s3_ids, cache_prefix=f"name_{mode}"
-    )
-    blocker_a = run_tfidf_blocking_batched(
-        s1_names, tfidf_name_vec, tfidf_name_mat, s2s3_ids, top_k=20
     )
 
     # ---- Also build TF-IDF on address (for feature reuse in Stage 3) ----
     tfidf_addr_vec, tfidf_addr_mat, tfidf_addr_ids = build_tfidf_blocker(
         s2s3_addrs, s2s3_ids, cache_prefix=f"addr_{mode}"
     )
+
+    # ---- Blocker A: MinHash LSH on char trigrams ----
+    print("\n    Building Blocker A (MinHash LSH on char trigrams) ...")
+    t_a = time.time()
+    lsh, minhashes = build_blocker_a(
+        s2s3, cache_path=os.path.join(CACHE_DIR, f"blocker_a_{mode}.pkl")
+    )
+    print(f"    Blocker A ready in {time.time()-t_a:.1f}s")
+
+    # ---- Blocker D: Token Inverted Index ----
+    print("\n    Building Blocker D (token inverted index) ...")
+    t_d = time.time()
+    token_index = build_blocker_d(s2s3)
+    print(f"    Blocker D ready in {time.time()-t_d:.1f}s")
 
     # ---- Blocker B: LaBSE + HNSW ----
     s2s3_embs, s2s3_id_map = encode_labse_batched(
@@ -612,17 +744,22 @@ def run_stage_2(data, split_data=None, mode="train"):
         blocker_c = run_bm25_blocking(s1_query_tokens, bm25, s2s3_ids, top_k=15)
         del s1_query_tokens
     else:
-        blocker_c = {}  # empty — pipeline degrades to 2 blockers
+        blocker_c = {}  # empty — pipeline degrades gracefully
         print("    Blocker C skipped (BM25 unavailable)")
 
     # Free memory
     del corpus_tokens, bm25
     gc.collect()
 
-    # ---- Union and cap ----
+    # ---- Union and cap (all 4 blockers) ----
     candidates, bm25_scores = union_and_cap_candidates(
-        s1_ids, blocker_a, b_labels, b_dists, blocker_c, s2s3_ids, cap=60
+        s1_ids, s1_names, lsh, b_labels, b_dists, blocker_c, s2s3_ids,
+        token_index, cap=60
     )
+
+    # Free blocker memory
+    del lsh, minhashes, token_index
+    gc.collect()
 
     result = {
         "candidates": candidates,
