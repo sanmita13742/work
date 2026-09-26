@@ -1,0 +1,8 @@
+research.md
+*.zip
+dataset/
+cache/
+output/
+__pycache__/
+*.pyc
+.DS_Store

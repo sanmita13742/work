@@ -1,0 +1,37 @@
+# =============================================================================
+# Entity Resolution Pipeline — Pinned Dependencies
+# =============================================================================
+# Install:  pip install -r requirements.txt
+# GPU note: install torch with CUDA *before* this file if running on GPU.
+#   pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+# NOTE: hnswlib requires a C++ compiler. On Kaggle/Linux it installs cleanly.
+#   On Windows, install "Microsoft C++ Build Tools" first.
+# =============================================================================
+
+# Core data / ML
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+scipy==1.13.1
+joblib==1.4.2
+
+# Gradient-boosted tree classifier — MIT license
+lightgbm==4.4.0
+
+# String similarity
+rapidfuzz==3.9.4
+jellyfish==1.1.0
+
+# BM25 retrieval
+rank-bm25==0.2.2
+
+# HNSW approximate nearest-neighbor index
+hnswlib==0.8.0
+
+# Transformer models (LaBSE, cross-encoder)
+sentence-transformers==3.0.1
+transformers==4.42.4
+torch>=2.2.0
+
+# Utilities
+tqdm==4.66.4
