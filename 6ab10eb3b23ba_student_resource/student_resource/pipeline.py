@@ -71,6 +71,7 @@ from pathlib import Path
 
 import jellyfish
 import joblib
+from joblib import Parallel, delayed
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -328,7 +329,7 @@ def build_tfidf_blocker(texts, ids, cache_prefix):
 # no dense matrix anywhere. Uses band hashing, not dot products.
 # datasketch: MIT license ✓
 
-MINHASH_NUM_PERM = 64       # accuracy/speed tradeoff (reduced from 128 to prevent OOM)
+MINHASH_NUM_PERM = 128       # Increased to 128 for higher accuracy (batched processing avoids OOM)
 MINHASH_THRESHOLD = 0.15    # low = high recall; tune on val if needed
 
 
@@ -347,53 +348,60 @@ def _make_minhash(text: str, num_perm: int = MINHASH_NUM_PERM) -> MinHash:
     return m
 
 
-def build_blocker_a(records_s2s3: pd.DataFrame,
-                    cache_path: str = None) -> tuple:
+def run_blocker_a_batched(s1_names, s1_ids, records_s2s3, cache_path=None, chunk_size=2_000_000):
     """
-    Build MinHash LSH index over all S2+S3 norm_names.
-    Returns (lsh, minhashes_dict).
-
-    Build time: ~60-120s for 10M records.
-    Query time: ~1-5ms per S1 entity.
-    RAM: ~2GB. No dense matrix anywhere.
-
-    Loads from cache if cache_path exists — skip rebuild on reruns.
+    Batch-wise MinHash LSH to avoid memory exhaustion on 10.3M records.
+    Pre-computes S1 hashes, then processes S2+S3 in chunks to keep RAM usage minimal.
     """
-    if cache_path is None:
-        cache_path = os.path.join(CACHE_DIR, "blocker_a.pkl")
-
-    if os.path.exists(cache_path):
-        print(f"    [Blocker A] Loading from cache: {cache_path}")
+    if cache_path and os.path.exists(cache_path):
+        print(f"    [Blocker A] Loading cached batched candidates from {cache_path}")
         return joblib.load(cache_path)
 
-    print(f"    [Blocker A] Building MinHash LSH "
-          f"(threshold={MINHASH_THRESHOLD}, num_perm={MINHASH_NUM_PERM}) ...")
+    print(f"    [Blocker A] Running batch-wise (chunk={chunk_size})...")
+    
+    print("    [Blocker A] Hashing S1 names in parallel...")
+    s1_minhashes = Parallel(n_jobs=-1, batch_size=1000)(
+        delayed(_make_minhash)(n) for n in tqdm(s1_names, desc="S1 Hashing")
+    )
+    
+    all_candidates = {eid: set() for eid in s1_ids}
+    n_s2s3 = len(records_s2s3)
+    
+    for start in range(0, n_s2s3, chunk_size):
+        end = min(start + chunk_size, n_s2s3)
+        print(f"    [Blocker A] Building LSH for S2+S3 chunk {start:,} to {end:,} ...")
+        chunk_df = records_s2s3.iloc[start:end]
+        
+        lsh = MinHashLSH(threshold=MINHASH_THRESHOLD, num_perm=MINHASH_NUM_PERM)
+        
+        chunk_names = chunk_df['norm_name'].tolist()
+        chunk_eids = chunk_df['entity_id'].tolist()
+        
+        chunk_minhashes = Parallel(n_jobs=-1, batch_size=1000)(
+            delayed(_make_minhash)(n) for n in chunk_names
+        )
+        
+        for eid, m in zip(chunk_eids, chunk_minhashes):
+            try:
+                lsh.insert(eid, m)
+            except ValueError:
+                pass
+                
+        print(f"    [Blocker A] Querying chunk...")
+        for s1_id, m_s1 in zip(s1_ids, s1_minhashes):
+            hits = lsh.query(m_s1)
+            if hits:
+                all_candidates[s1_id].update(hits)
+                
+        del lsh, chunk_minhashes, chunk_names, chunk_eids
+        gc.collect()
 
-    lsh = MinHashLSH(threshold=MINHASH_THRESHOLD, num_perm=MINHASH_NUM_PERM)
-    minhashes = {}
-
-    for i, (_, row) in enumerate(records_s2s3.iterrows()):
-        eid = row['entity_id']
-        m = _make_minhash(row['norm_name'])
-        try:
-            lsh.insert(eid, m)
-        except ValueError:
-            # duplicate key — skip (shouldn't happen with unique entity_ids)
-            pass
-        minhashes[eid] = m
-        if i % 500_000 == 0 and i > 0:
-            print(f"      indexed {i:,} records ...")
-
-    os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else ".", exist_ok=True)
-    joblib.dump((lsh, minhashes), cache_path, compress=3)
-    print(f"    [Blocker A] Done. Indexed {len(minhashes):,} records. Saved to {cache_path}")
-    return lsh, minhashes
-
-
-def query_blocker_a(norm_name_s1: str, lsh: MinHashLSH) -> set:
-    """Query MinHash LSH for a single S1 norm_name."""
-    m = _make_minhash(norm_name_s1)
-    return set(lsh.query(m))
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) if os.path.dirname(cache_path) else ".", exist_ok=True)
+        joblib.dump(all_candidates, cache_path, compress=3)
+        print(f"    [Blocker A] Saved batched candidates to {cache_path}")
+        
+    return all_candidates
 
 
 # ── BLOCKER D: Token Inverted Index ─────────────────────────────────────
@@ -449,7 +457,7 @@ def query_blocker_d(norm_name_s1: str,
     return {eid for eid, cnt in hits.items() if cnt >= min_shared}
 
 
-def encode_labse_batched(entity_ids, texts, cache_name, batch_size=512):
+def encode_labse_batched(entity_ids, texts, cache_name, batch_size=2048):
     """Encode texts with LaBSE in batches and cache to disk."""
     emb_path = os.path.join(CACHE_DIR, f"labse_embeddings_{cache_name}.npy")
     ids_path = os.path.join(CACHE_DIR, f"labse_id_map_{cache_name}.pkl")
@@ -592,7 +600,7 @@ def run_bm25_blocking(s1_queries, bm25, s2s3_ids, top_k=15):
     return results
 
 
-def union_and_cap_candidates(s1_ids, s1_names, lsh, blocker_b_labels,
+def union_and_cap_candidates(s1_ids, s1_names, blocker_a_cands, blocker_b_labels,
                               blocker_b_dists, blocker_c, s2s3_ids,
                               token_index, cap=60):
     """Union all 4 blocker results and cap per S1 entity.
@@ -619,7 +627,7 @@ def union_and_cap_candidates(s1_ids, s1_names, lsh, blocker_b_labels,
                     b_cands.add(s2s3_ids[idx])
 
         # ── Blocker A: MinHash LSH (char trigram fuzzy) ──────────────
-        a_cands = query_blocker_a(norm_name, lsh) if lsh is not None else set()
+        a_cands = blocker_a_cands.get(s1_id, set())
 
         # ── Blocker C: BM25 (ranked word match) ──────────────────────
         c_cands_scored = blocker_c.get(i, [])
@@ -714,8 +722,9 @@ def run_stage_2(data, split_data=None, mode="train"):
     # ---- Blocker A: MinHash LSH on char trigrams ----
     print("\n    Building Blocker A (MinHash LSH on char trigrams) ...")
     t_a = time.time()
-    lsh, minhashes = build_blocker_a(
-        s2s3, cache_path=os.path.join(CACHE_DIR, f"blocker_a_{mode}.pkl")
+    blocker_a_cands = run_blocker_a_batched(
+        s1_names, s1_ids, s2s3, 
+        cache_path=os.path.join(CACHE_DIR, f"blocker_a_cands_{mode}.pkl")
     )
     print(f"    Blocker A ready in {time.time()-t_a:.1f}s")
 
@@ -753,12 +762,12 @@ def run_stage_2(data, split_data=None, mode="train"):
 
     # ---- Union and cap (all 4 blockers) ----
     candidates, bm25_scores = union_and_cap_candidates(
-        s1_ids, s1_names, lsh, b_labels, b_dists, blocker_c, s2s3_ids,
+        s1_ids, s1_names, blocker_a_cands, b_labels, b_dists, blocker_c, s2s3_ids,
         token_index, cap=60
     )
 
     # Free blocker memory
-    del lsh, minhashes, token_index
+    del blocker_a_cands, token_index
     gc.collect()
 
     result = {
@@ -1151,12 +1160,14 @@ def run_stage_4(feat_data, split_data):
 
     # LightGBM: MIT license ✓
     lgb_params = {
-        "n_estimators": 1000,
-        "learning_rate": 0.03,
-        "num_leaves": 63,
-        "min_child_samples": 20,
+        "n_estimators": 2500,         # Increased for better accuracy
+        "learning_rate": 0.015,       # Decreased for better generalization
+        "num_leaves": 127,            # Increased model capacity
+        "min_child_samples": 30,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,             # Added L1 regularization
+        "reg_lambda": 0.1,            # Added L2 regularization
         "scale_pos_weight": class_imbalance,
         "n_jobs": -1,
         "random_state": 42,
@@ -1234,11 +1245,11 @@ def run_stage_4(feat_data, split_data):
         "val_recall": float(best_r),
         "val_f05": float(best_f05),
         "best_iteration": int(model.best_iteration_),
-        "use_cross_encoder": False,
-        "cross_encoder_uncertain_low": 0.3,
-        "cross_encoder_uncertain_high": 0.7,
-        "cross_encoder_weight_lgb": 0.6,
-        "cross_encoder_weight_ce": 0.4,
+        "use_cross_encoder": True,       # Enabled to utilize GPU and top leaderboard
+        "cross_encoder_uncertain_low": 0.2,   # Expanded window
+        "cross_encoder_uncertain_high": 0.8,
+        "cross_encoder_weight_lgb": 0.5,
+        "cross_encoder_weight_ce": 0.5,
     }
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
