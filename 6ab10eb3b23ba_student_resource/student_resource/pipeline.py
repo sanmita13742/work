@@ -457,46 +457,48 @@ def query_blocker_d(norm_name_s1: str,
     return {eid for eid, cnt in hits.items() if cnt >= min_shared}
 
 
-def encode_labse_batched(entity_ids, texts, cache_name, batch_size=2048):
-    """Encode texts with LaBSE in batches and cache to disk."""
-    emb_path = os.path.join(CACHE_DIR, f"labse_embeddings_{cache_name}.npy")
-    ids_path = os.path.join(CACHE_DIR, f"labse_id_map_{cache_name}.pkl")
+def encode_e5_batched(entity_ids, texts, cache_name, batch_size=2048):
+    """Encode texts with Multilingual E5 in batches and cache to disk."""
+    emb_path = os.path.join(CACHE_DIR, f"e5_embeddings_{cache_name}.npy")
+    ids_path = os.path.join(CACHE_DIR, f"e5_id_map_{cache_name}.pkl")
 
     if os.path.exists(emb_path) and os.path.exists(ids_path):
-        print(f"    Loading cached LaBSE embeddings ({cache_name})...")
+        print(f"    Loading cached E5 embeddings ({cache_name})...")
         embeddings = np.load(emb_path, mmap_mode="r")
         id_map = joblib.load(ids_path)
         return embeddings, id_map
 
-    print(f"    Encoding {len(texts):,} texts with LaBSE ({cache_name})...")
+    print(f"    Encoding {len(texts):,} texts with Multilingual E5 ({cache_name})...")
     from sentence_transformers import SentenceTransformer
-    # LaBSE: Apache 2.0 license, 471M parameters — within 8B cap ✓
     device = "cuda" if _has_cuda() else "cpu"
-    model = SentenceTransformer("sentence-transformers/LaBSE", device=device)
+    # Swap LaBSE for Multilingual E5 Large (as per research insights for zero-shot French)
+    model = SentenceTransformer("intfloat/multilingual-e5-large", device=device)
 
-    # Encode in batches and write to memory-mapped file for large datasets
-    dim = 768
+    # E5 requires the 'query: ' prefix for symmetric semantic similarity tasks
+    prefixed_texts = [f"query: {t}" for t in texts]
+
+    dim = 1024  # E5-large dimension
     n = len(texts)
     fp = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(n, dim))
 
-    for start in tqdm(range(0, n, batch_size), desc=f"    LaBSE {cache_name}"):
+    for start in tqdm(range(0, n, batch_size), desc=f"    E5 {cache_name}"):
         end = min(start + batch_size, n)
         batch_embs = model.encode(
-            texts[start:end], batch_size=batch_size,
+            prefixed_texts[start:end], batch_size=batch_size,
             show_progress_bar=False, convert_to_numpy=True,
             normalize_embeddings=True
         )
         fp[start:end] = batch_embs
 
     fp.flush()
-    del fp, model
+    del fp, model, prefixed_texts
     gc.collect()
 
     id_map = {eid: idx for idx, eid in enumerate(entity_ids)}
     joblib.dump(id_map, ids_path)
 
     embeddings = np.load(emb_path, mmap_mode="r")
-    print(f"    LaBSE ({cache_name}): shape=({n}, {dim})")
+    print(f"    E5 ({cache_name}): shape=({n}, {dim})")
     return embeddings, id_map
 
 
@@ -734,13 +736,13 @@ def run_stage_2(data, split_data=None, mode="train"):
     token_index = build_blocker_d(s2s3)
     print(f"    Blocker D ready in {time.time()-t_d:.1f}s")
 
-    # ---- Blocker B: LaBSE + HNSW ----
-    s2s3_embs, s2s3_id_map = encode_labse_batched(
+    # ---- Blocker B: Multilingual E5 + HNSW ----
+    s2s3_embs, s2s3_id_map = encode_e5_batched(
         s2s3_ids, s2s3_names, cache_name=f"s2s3_{mode}"
     )
     hnsw_index = build_hnsw_index(s2s3_embs, cache_name=f"s2s3_{mode}")
 
-    s1_embs, s1_id_map = encode_labse_batched(
+    s1_embs, s1_id_map = encode_e5_batched(
         s1_ids, s1_names, cache_name=f"s1_{mode}"
     )
     b_labels, b_dists = run_hnsw_blocking(s1_embs, hnsw_index, top_k=25)
@@ -850,7 +852,7 @@ FEATURE_NAMES = [
     "address_tfidf_cosine",      # 12
     "country_match",             # 13
     "bm25_score_normalized",     # 14
-    "embedding_cosine_labse",    # 15
+    "embedding_cosine_e5",       # 15
 ]
 
 
@@ -859,7 +861,7 @@ def compute_features_batch(pairs_data):
 
     Each element of pairs_data is a dict with keys:
         nn_s1, nn_cand, na_s1, na_cand, country_s1, country_cand,
-        tfidf_name_cos, tfidf_addr_cos, labse_cos, bm25_norm
+        tfidf_name_cos, tfidf_addr_cos, e5_cos, bm25_norm
     """
     features = np.zeros((len(pairs_data), 15), dtype=np.float32)
 
@@ -912,8 +914,8 @@ def compute_features_batch(pairs_data):
         features[i, 12] = 1.0 if c_s1 and c_cand and c_s1 == c_cand else 0.0
         # 14. bm25_score_normalized (pre-computed)
         features[i, 13] = d["bm25_norm"]
-        # 15. embedding_cosine_labse (pre-computed)
-        features[i, 14] = d["labse_cos"]
+        # 15. embedding_cosine_e5 (pre-computed)
+        features[i, 14] = d["e5_cos"]
 
     return features
 
@@ -960,11 +962,11 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
     name_id2idx = {eid: idx for idx, eid in enumerate(tfidf_name_ids)}
     addr_id2idx = {eid: idx for idx, eid in enumerate(tfidf_addr_ids)}
 
-    # Load LaBSE embeddings
-    s1_embs = np.load(os.path.join(CACHE_DIR, f"labse_embeddings_s1_{mode}.npy"), mmap_mode="r")
-    s1_id_map = joblib.load(os.path.join(CACHE_DIR, f"labse_id_map_s1_{mode}.pkl"))
-    s2s3_embs = np.load(os.path.join(CACHE_DIR, f"labse_embeddings_s2s3_{mode}.npy"), mmap_mode="r")
-    s2s3_id_map = joblib.load(os.path.join(CACHE_DIR, f"labse_id_map_s2s3_{mode}.pkl"))
+    # Load E5 embeddings
+    s1_embs = np.load(os.path.join(CACHE_DIR, f"e5_embeddings_s1_{mode}.npy"), mmap_mode="r")
+    s1_id_map = joblib.load(os.path.join(CACHE_DIR, f"e5_id_map_s1_{mode}.pkl"))
+    s2s3_embs = np.load(os.path.join(CACHE_DIR, f"e5_embeddings_s2s3_{mode}.npy"), mmap_mode="r")
+    s2s3_id_map = joblib.load(os.path.join(CACHE_DIR, f"e5_id_map_s2s3_{mode}.pkl"))
 
     # Build ground truth labels (train mode)
     gt_dict = {}
@@ -979,6 +981,24 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
     all_features = []
     all_labels = []
     all_pairs = []
+
+    def _apply_lexical_noise(text: str) -> str:
+        """Inject hard character-level noise to simulate real-world spelling errors."""
+        if not text or len(text) < 4: return text
+        tokens = text.split()
+        if not tokens: return text
+        choice = np.random.randint(0, 3)
+        if choice == 0: # Drop a random character
+            idx = np.random.randint(0, len(text))
+            return text[:idx] + text[idx+1:]
+        elif choice == 1: # Swap adjacent characters
+            idx = np.random.randint(0, len(text)-1)
+            return text[:idx] + text[idx+1] + text[idx] + text[idx+2:]
+        elif choice == 2 and len(tokens) > 1: # Drop a token
+            idx = np.random.randint(0, len(tokens))
+            tokens.pop(idx)
+            return " ".join(tokens)
+        return text
 
     total_pairs = sum(len(v) for v in candidates.values())
     print(f"    Computing features for {total_pairs:,} pairs...")
@@ -997,9 +1017,9 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
         s1_tfidf_name_vec = tfidf_name_vec.transform([nn_s1])
         s1_tfidf_addr_vec = tfidf_addr_vec.transform([na_s1])
 
-        # S1 LaBSE embedding
+        # E5 embedding
         s1_emb_idx = s1_id_map.get(s1_id)
-        s1_labse = np.array(s1_embs[s1_emb_idx]) if s1_emb_idx is not None else None
+        s1_e5 = np.array(s1_embs[s1_emb_idx]) if s1_emb_idx is not None else None
 
         # Max BM25 score for normalization
         max_bm25 = max(
@@ -1008,6 +1028,10 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
         )
 
         batch_data = []
+        aug_batch_data = []
+        aug_labels = []
+        aug_pairs = []
+
         for cand_id in cand_ids:
             nn_cand = s2s3_name_dict.get(cand_id, "")
             na_cand = s2s3_addr_dict.get(cand_id, "")
@@ -1032,13 +1056,13 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
                     )
                     tfidf_addr_cos = float(sim[0, 0])
 
-            # LaBSE cosine
-            labse_cos = 0.0
-            if s1_labse is not None:
+            # E5 cosine
+            e5_cos = 0.0
+            if s1_e5 is not None:
                 cand_emb_idx = s2s3_id_map.get(cand_id)
                 if cand_emb_idx is not None:
-                    cand_labse = np.array(s2s3_embs[cand_emb_idx])
-                    labse_cos = float(np.dot(s1_labse, cand_labse))
+                    cand_e5 = np.array(s2s3_embs[cand_emb_idx])
+                    e5_cos = float(np.dot(s1_e5, cand_e5))
 
             # BM25 normalized
             bm25_val = bm25_scores.get((s1_id, cand_id), 0.0)
@@ -1050,17 +1074,40 @@ def run_stage_3(data, blocking_result, split_data=None, mode="train"):
                 "country_s1": country_s1, "country_cand": country_cand,
                 "tfidf_name_cos": tfidf_name_cos,
                 "tfidf_addr_cos": tfidf_addr_cos,
-                "labse_cos": labse_cos,
+                "e5_cos": e5_cos,
                 "bm25_norm": bm25_norm,
             })
 
             all_pairs.append((s1_id, cand_id))
             if mode == "train":
                 true_matches = gt_dict.get(s1_id, set())
-                all_labels.append(1 if cand_id in true_matches else 0)
+                is_match = 1 if cand_id in true_matches else 0
+                all_labels.append(is_match)
+                
+                # Apply data augmentation for positive pairs to increase precision & generalizability
+                if is_match == 1:
+                    aug_nn_s1 = _apply_lexical_noise(nn_s1)
+                    aug_batch_data.append({
+                        "nn_s1": aug_nn_s1, "nn_cand": nn_cand,
+                        "na_s1": na_s1, "na_cand": na_cand,
+                        "country_s1": country_s1, "country_cand": country_cand,
+                        "tfidf_name_cos": tfidf_name_cos, # Re-use for speed
+                        "tfidf_addr_cos": tfidf_addr_cos,
+                        "e5_cos": e5_cos,
+                        "bm25_norm": bm25_norm,
+                    })
+                    aug_pairs.append((s1_id, cand_id))
+                    aug_labels.append(1)
 
         feats = compute_features_batch(batch_data)
         all_features.append(feats)
+        
+        if mode == "train" and aug_batch_data:
+            aug_feats = compute_features_batch(aug_batch_data)
+            all_features.append(aug_feats)
+            all_pairs.extend(aug_pairs)
+            all_labels.extend(aug_labels)
+            
         processed += len(cand_ids)
 
     X = np.vstack(all_features) if all_features else np.zeros((0, 15), dtype=np.float32)
@@ -1274,9 +1321,9 @@ def run_cross_encoder_reranking(probs, config, pairs, data_test):
     print("=" * 50 + " STAGE 4B: CROSS-ENCODER RE-RANKING " + "=" * 50)
 
     from sentence_transformers import CrossEncoder
-    # cross-encoder/ms-marco-MiniLM-L-6-v2: Apache 2.0, ~22M params ✓
+    # BAAI/bge-reranker-m3: state-of-the-art multilingual reranker for maximum zero-shot recall
     device = "cuda" if _has_cuda() else "cpu"
-    ce_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device=device)
+    ce_model = CrossEncoder("BAAI/bge-reranker-m3", device=device)
 
     s1, s2, s3 = data_test["s1"], data_test["s2"], data_test["s3"]
     s2s3 = pd.concat([s2, s3], ignore_index=True)
